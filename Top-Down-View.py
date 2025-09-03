@@ -4,7 +4,12 @@ from Blender import Blender  # 確保你有這個模組
 
 class ImageStitcher:
     def __init__(self):
-        pass
+        # Reuse a single Blender instance and cache warp parameters
+        try:
+            self.blender = Blender()
+        except ImportError:
+            self.blender = None
+        self._warp_cache = {}
 
     def removeBlackBorder(self, img):
         """快速移除拼接後的黑邊"""
@@ -43,75 +48,87 @@ class ImageStitcher:
         return pts_trans[:, :2]
 
     def warp(self, imgs, HomoMat):
-        """拼接影像"""
+        """拼接影像（帶快取）"""
         img_left, img_right = imgs
-
-        try:
-            blender = Blender()
-        except ImportError:
-            print("⚠️ 無法導入 Blender 模組，使用簡單混合")
-            blender = None
 
         # 確保 Homography 是 3x3
         H = HomoMat.astype(np.float64)
-        
-        # 確保 H[2,2] 不為零
-        if abs(H[2,2]) < 1e-8:
-            print("⚠️ Homography 矩陣異常")
-            return None
 
-        # 計算平方根矩陣
-        M = self._matrix_square_root(H)
-        if M is None:
-            print("⚠️ 無法計算 Homography 平方根，使用原始矩陣")
-            # fallback: 使用簡單的拼接方法
-            return self._simple_stitch(img_left, img_right, H)
+        # 快取 key（包含 H 與影像尺寸）
+        h_key = H.tobytes()
+        shape_key = (img_left.shape[:2], img_right.shape[:2])
+        cache_key = (h_key, shape_key)
 
-        # 計算逆矩陣
-        try:
-            Minv = np.linalg.inv(M)
-        except np.linalg.LinAlgError:
-            print("⚠️ 無法計算逆矩陣")
-            return None
+        params = self._warp_cache.get(cache_key)
+        if params is None:
+            # 確保 H[2,2] 不為零
+            if abs(H[2,2]) < 1e-8:
+                print("⚠️ Homography 矩陣異常")
+                return None
 
-        # Normalize
-        M = M / M[2,2]
-        Minv = Minv / Minv[2,2]
+            # 計算平方根矩陣（右圖到左圖的中間視角）
+            M = self._matrix_square_root(H)
+            if M is None:
+                print("⚠️ 無法計算 Homography 平方根，使用原始矩陣")
+                return self._simple_stitch(img_left, img_right, H)
 
-        # 計算邊界
-        hl, wl = img_left.shape[:2]
-        hr, wr = img_right.shape[:2]
+            # 計算逆矩陣
+            try:
+                Minv = np.linalg.inv(M)
+            except np.linalg.LinAlgError:
+                print("⚠️ 無法計算逆矩陣")
+                return None
 
-        corners_left = np.array([[0,0],[wl,0],[wl,hl],[0,hl]], dtype=np.float64)
-        corners_right = np.array([[0,0],[wr,0],[wr,hr],[0,hr]], dtype=np.float64)
+            # Normalize
+            if abs(M[2,2]) > 1e-12:
+                M = M / M[2,2]
+            if abs(Minv[2,2]) > 1e-12:
+                Minv = Minv / Minv[2,2]
 
-        tl = self._transform_points(Minv, corners_left)
-        tr = self._transform_points(M, corners_right)
+            # 計算邊界
+            hl, wl = img_left.shape[:2]
+            hr, wr = img_right.shape[:2]
+            corners_left = np.array([[0,0],[wl,0],[wl,hl],[0,hl]], dtype=np.float64)
+            corners_right = np.array([[0,0],[wr,0],[wr,hr],[0,hr]], dtype=np.float64)
 
-        all_pts = np.vstack([tl, tr])
-        min_x, min_y = np.min(all_pts, axis=0)
-        max_x, max_y = np.max(all_pts, axis=0)
+            tl = self._transform_points(Minv, corners_left)
+            tr = self._transform_points(M, corners_right)
 
-        tx, ty = -min_x, -min_y
-        T = np.array([[1,0,tx],[0,1,ty],[0,0,1]], dtype=np.float64)
+            all_pts = np.vstack([tl, tr])
+            min_x, min_y = np.min(all_pts, axis=0)
+            max_x, max_y = np.max(all_pts, axis=0)
 
-        out_w = int(np.ceil(max_x - min_x))
-        out_h = int(np.ceil(max_y - min_y))
-        out_w = max(out_w, 1)
-        out_h = max(out_h, 1)
+            tx, ty = -min_x, -min_y
+            T = np.array([[1,0,tx],[0,1,ty],[0,0,1]], dtype=np.float64)
 
-        HL = T.dot(Minv)
-        HR = T.dot(M)
+            out_w = int(np.ceil(max_x - min_x))
+            out_h = int(np.ceil(max_y - min_y))
+            out_w = max(out_w, 1)
+            out_h = max(out_h, 1)
+
+            HL = T.dot(Minv)
+            HR = T.dot(M)
+
+            params = {
+                "HL": HL,
+                "HR": HR,
+                "size": (out_w, out_h)
+            }
+            self._warp_cache[cache_key] = params
+
+        out_w, out_h = params["size"]
+        HL = params["HL"]
+        HR = params["HR"]
 
         warped_left = cv2.warpPerspective(img_left, HL, (out_w, out_h), flags=cv2.INTER_LINEAR)
         warped_right = cv2.warpPerspective(img_right, HR, (out_w, out_h), flags=cv2.INTER_LINEAR)
 
         # 混合影像
-        if blender is not None:
-            out = blender.linearBlending([warped_left, warped_right])
+        if self.blender is not None:
+            out = self.blender.linearBlending([warped_left, warped_right])
         else:
             out = self._simple_blend(warped_left, warped_right)
-        
+
         out = self.removeBlackBorder(out)
         return out
 
@@ -145,6 +162,9 @@ class ImageStitcher:
 
 
 if __name__ == "__main__":
+    # 啟用 OpenCV 最佳化
+    cv2.setUseOptimized(True)
+
     # 左右相機 index
     cap_left = cv2.VideoCapture(0)
     cap_right = cv2.VideoCapture(1)
@@ -154,6 +174,19 @@ if __name__ == "__main__":
     cap_left.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
     cap_right.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
     cap_right.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+
+    # 嘗試降低延遲：減少緩衝區與使用 MJPG（若相機支援）
+    try:
+        cap_left.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap_right.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
+    try:
+        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+        cap_left.set(cv2.CAP_PROP_FOURCC, fourcc)
+        cap_right.set(cv2.CAP_PROP_FOURCC, fourcc)
+    except Exception:
+        pass
 
     # 固定 Homography (3x3)
     HomoMat = np.array([
